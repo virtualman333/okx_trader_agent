@@ -48,6 +48,7 @@ OKX Trader/
 │   ├── dashboard.py            面板生成器（自动输出 DASHBOARD.md）
 │   ├── archive_round.py        轮次归档器（唯一写入口，保证只追加）
 │   └── report.py               日报/周报统计引擎
+jin10_client.py          金十数据财经 MCP 客户端（标准 Streamable HTTP + Bearer）
 ├── logs/
 │   ├── YYYY-MM/YYYY-MM-DD.md   每轮完整执行日志（人读，只追加）
 │   └── rounds.jsonl            每轮结构化快照（机读，只追加）
