@@ -303,6 +303,34 @@ def main():
     if a.gate_only:
         return 0
 
+    # 0) 可信消息复用：库里最近 6 小时已有 A 级（双源已验证）消息则直接复用，
+    #    跳过金十抓取（避免重复查询）与二次验证。
+    cached = run_py("news_db.py", ["--query", "--hours", "6", "--min-cred", "A", "--limit", "20"])
+    cache_items = (cached or {}).get("items") or []
+    if cache_items:
+        cands = []
+        for e in cache_items:
+            cands.append({
+                "title": e.get("title", ""),
+                "source": e.get("source", ""),
+                "url": e.get("url"),
+                "published_at": e.get("published_at", ""),
+                "summary": e.get("summary", ""),
+                "credibility": "A",
+                "impact": e.get("impact", "low"),
+                "ttl": e.get("ttl", "short"),
+                "direction": e.get("direction", "neutral"),
+                "verification": e.get("verification", ""),
+                "_from_cache": True,
+                "_needs_review": False,
+            })
+        out_path = a.out if os.path.isabs(a.out) else os.path.join(ROOT, a.out)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(cands, f, ensure_ascii=False, indent=2)
+        print(f"[cache] 复用已入库可信消息 {len(cands)} 条（跳过金十抓取与二次验证）-> {out_path}")
+        return 0
+
     # 采集
     jin10_items = fetch_jin10(a.limit)
     okx_items, okx_status = fetch_okx_news(a.limit)

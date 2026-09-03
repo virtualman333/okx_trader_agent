@@ -31,6 +31,11 @@ import re
 import sys
 from datetime import datetime, timezone, timedelta
 
+try:
+    import news_db  # 同目录 SQLite 存储层（可信消息复用索引）
+except Exception:
+    news_db = None
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NEWS_DIR = os.path.join(ROOT, "news")
 NEWS_JSONL = os.path.join(NEWS_DIR, "news.jsonl")
@@ -330,10 +335,18 @@ def main():
         print("-" * 70)
         return 0
 
-    # 1) 追加到 jsonl
+    # 1) 追加到 jsonl（只追加审计流水，L1-7）
     with open(NEWS_JSONL, "a", encoding="utf-8") as f:
         for e in accepted:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    # 1.5) 同步写 SQLite（可信消息复用索引；失败不影响 jsonl 主流程）
+    if news_db is not None:
+        try:
+            added, dup = news_db.insert_many(accepted)
+            print("  → news/news.db（SQLite 索引，新增 %d / 重复 %d）" % (added, dup))
+        except Exception as e:
+            print("  [警告] SQLite 写入失败（不影响 jsonl）: %s" % str(e)[:120])
 
     # 2) 重建当日 md（读取当日全部条目，按天聚合重写是可接受的：
     #    原始流水在 jsonl 里只追加，md 只是投影视图）
