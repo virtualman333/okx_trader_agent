@@ -8,9 +8,11 @@ market_scan.py — OKX 永续合约多周期行情扫描与技术指标计算引
 输出：JSON 摘要到 stdout，同时可选落盘归档。
 
 用法:
-    python market_scan.py                          # 扫描 BTC/ETH，输出 JSON
+    python market_scan.py                          # 按 24h 成交额取前 15 个 USDT 永续扫描
+    python market_scan.py --top 20                 # 指定候选池大小
+    python market_scan.py --inst BTC-USDT-SWAP     # 指定单个标的（可重复）
+    python market_scan.py --insts BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP
     python market_scan.py --save <dir>             # 同时归档快照
-    python market_scan.py --inst BTC-USDT-SWAP     # 指定单个标的
 """
 
 from __future__ import annotations
@@ -24,11 +26,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 BASE = "https://www.okx.com"
 CST = timezone(timedelta(hours=8))
 DEFAULT_INSTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+# 默认候选池大小：按 24h 成交额取前 N 个 USDT 永续（用户指令：不限 BTC/ETH，目标是盈利）
+DEFAULT_TOP = 15
+MAX_WORKERS = 8
 # 分析用周期：4H 定大势，1H 定结构，15m 定入场
 BARS = ["4H", "1H", "15m"]
 CANDLE_LIMIT = 300
@@ -272,6 +278,112 @@ def fetch_context(inst: str) -> dict:
     return ctx
 
 
+def fetch_top_insts(top: int) -> list[tuple[str, float]]:
+    """按 24h 成交额（USDT 计价）取前 top 个 USDT 永续合约（state=live）。
+
+    用户指令（2026-09-03）：不限 BTC/ETH，可交易交易所支持的任意 USDT 永续。
+    候选池按流动性（成交额）排序，AI 在候选池内自由选择方向与标的。
+    """
+    res = _http_get("/api/v5/market/tickers", {"instType": "SWAP"})
+    rows = []
+    for r in res.get("data", []):
+        inst = r.get("instId", "")
+        if not inst.endswith("-USDT-SWAP"):
+            continue
+        try:
+            # volCcy24h 是「币数量」，须 × 现价才是 USDT 计价的成交额（否则低价 meme 币会霸榜）
+            last = float(r.get("last") or 0)
+            ccy = float(r.get("volCcy24h") or 0)
+            vol = ccy * last
+        except (TypeError, ValueError):
+            vol = 0.0
+        rows.append((inst, vol))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:top]
+
+
+def fetch_specs(insts: list[str]) -> dict[str, dict]:
+    """获取合约规格（每张面值 / 数量步长 / 价格步长 / 最小下单），一次拉全量再筛选。"""
+    want = set(insts)
+    specs: dict[str, dict] = {}
+    try:
+        res = _http_get("/api/v5/public/instruments", {"instType": "SWAP"})
+    except Exception:  # noqa: BLE001
+        return specs
+    for r in res.get("data", []):
+        iid = r.get("instId", "")
+        if iid not in want:
+            continue
+        try:
+            specs[iid] = {
+                "ctVal": float(r.get("ctVal") or 0),
+                "lotSz": float(r.get("lotSz") or 0),
+                "minSz": float(r.get("minSz") or 0),
+                "tickSz": float(r.get("tickSz") or 0),
+                "ctType": r.get("ctType", ""),
+                "settleCcy": r.get("settleCcy", ""),
+                "state": r.get("state", ""),
+            }
+        except (TypeError, ValueError):
+            continue
+    return specs
+
+
+def digest(inst: str, item: dict) -> str:
+    """生成单标的的一行精简摘要，供 LLM 全览候选池（避免把整段行情 JSON 塞进上下文）。"""
+    bars = item.get("bars", {})
+    ctx = item.get("context", {})
+    conf = item.get("confluence", {})
+    spec = item.get("spec", {})
+    tk = ctx.get("ticker", {}) or {}
+    fd = ctx.get("funding", {}) or {}
+
+    last = tk.get("last")
+    last_s = f"{last:.4f}" if isinstance(last, (int, float)) else "?"
+    chg = tk.get("chg24h_pct")
+    chg_s = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "?"
+
+    def g(bar: str, key: str):
+        v = (bars.get(bar) or {}).get(key)
+        return v
+
+    def trend(bar: str):
+        return str(g(bar, "trend") or "-")
+
+    rsi1h = g("1H", "rsi14")
+    vr = g("1H", "vol_ratio")
+    atrp = g("1H", "atr_pct")
+
+    # 区间分位：60 根 K 线摆动区间内的位置
+    lo = g("4H", "swing_low_60")
+    hi = g("4H", "swing_high_60")
+    close4h = g("4H", "close")
+    rp = "?"
+    if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and isinstance(close4h, (int, float)) and hi > lo:
+        rp = f"{max(0.0, min(100.0, (close4h - lo) / (hi - lo) * 100)):.0f}%"
+
+    fr = fd.get("rate_pct")
+    fr_s = f"{fr:+.4f}%" if isinstance(fr, (int, float)) else "?"
+
+    parts = [
+        f"{inst} 价{last_s}({chg_s})",
+        f"共振{conf.get('score', '?')}",
+        f"4H:{trend('4H')}/1H:{trend('1H')}/15m:{trend('15m')}",
+        f"RSI(1H){rsi1h if isinstance(rsi1h, (int, float)) else '?'}",
+        f"量比{vr if isinstance(vr, (int, float)) else '?'}",
+        f"ATR%{atrp if isinstance(atrp, (int, float)) else '?'}",
+        f"分位{rp}",
+        f"费{fr_s}",
+    ]
+    if spec:
+        parts.append(
+            f"spec(面值{spec.get('ctVal')} 步长{spec.get('lotSz')} 最小{spec.get('minSz')} 价格步{spec.get('tickSz')})"
+        )
+    if item.get("error"):
+        parts.append(f"错误:{item['error'][:60]}")
+    return " | ".join(parts)
+
+
 def confluence(bars: dict) -> dict:
     """多周期共振打分：-100(极空) ~ +100(极多)。权重 4H:0.5 / 1H:0.3 / 15m:0.2"""
     weights = {"4H": 0.5, "1H": 0.3, "15m": 0.2}
@@ -310,32 +422,82 @@ def confluence(bars: dict) -> dict:
     return {"score": round(score, 1), "per_bar": detail}
 
 
-def scan(insts: list[str]) -> dict:
+def scan_one(inst: str, specs: dict[str, dict]) -> tuple[str, dict]:
+    """扫描单个标的（供线程池并发）。"""
+    try:
+        bars = {b: analyze_bar(inst, b) for b in BARS}
+        item = {"bars": bars, "context": fetch_context(inst), "confluence": confluence(bars)}
+        if inst in specs:
+            item["spec"] = specs[inst]
+    except Exception as exc:  # noqa: BLE001
+        item = {"error": str(exc)}
+    return inst, item
+
+
+def scan(insts: list[str], specs: dict[str, dict]) -> dict:
     now = datetime.now(CST)
     out = {
         "scan_time_cst": now.strftime("%Y-%m-%d %H:%M:%S"),
         "scan_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "source": "OKX public REST (live market data)",
         "instruments": {},
+        "digest": [],
     }
+    results: dict[str, dict] = {}
+    if len(insts) <= 2:
+        for inst in insts:
+            i, item = scan_one(inst, specs)
+            results[i] = item
+    else:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = {ex.submit(scan_one, inst, specs): inst for inst in insts}
+            for fut in as_completed(futs):
+                try:
+                    i, item = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    i, item = futs[fut], {"error": str(exc)}
+                results[i] = item
+    # 保持 insts 原始顺序输出
     for inst in insts:
-        try:
-            bars = {b: analyze_bar(inst, b) for b in BARS}
-            item = {"bars": bars, "context": fetch_context(inst), "confluence": confluence(bars)}
-        except Exception as exc:  # noqa: BLE001
-            item = {"error": str(exc)}
+        item = results.get(inst, {"error": "扫描失败"})
         out["instruments"][inst] = item
+        out["digest"].append(digest(inst, item))
     return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--inst", action="append", help="标的，可重复；默认 BTC+ETH 永续")
+    ap.add_argument("--inst", action="append", help="指定标的，可重复（优先级最高）")
+    ap.add_argument("--insts", help="逗号分隔的标的列表，如 BTC-USDT-SWAP,ETH-USDT-SWAP")
+    ap.add_argument("--top", type=int, default=0, help=f"按 24h 成交额取前 N 个 USDT 永续（默认 {DEFAULT_TOP}）")
     ap.add_argument("--save", help="快照归档目录")
     args = ap.parse_args()
 
-    insts = args.inst or DEFAULT_INSTS
-    result = scan(insts)
+    # 候选池优先级：--inst/--insts 显式指定 > --top N > 默认 top
+    explicit = list(args.inst or [])
+    if args.insts:
+        explicit += [s.strip() for s in args.insts.split(",") if s.strip()]
+
+    if explicit:
+        insts = explicit
+        universe = None
+    else:
+        top = args.top if args.top and args.top > 0 else DEFAULT_TOP
+        ranked = fetch_top_insts(top)
+        insts = [i for i, _ in ranked]
+        universe = [
+            {"instId": i, "turnoverUsd24h": round(v, 2), "rank": idx + 1}
+            for idx, (i, v) in enumerate(ranked)
+        ]
+
+    specs = fetch_specs(insts)
+    result = scan(insts, specs)
+    if universe is not None:
+        result["universe"] = universe
+        result["universe_note"] = (
+            "候选池=按 24h 成交额排序的前 N 个 USDT 永续（state=live）。"
+            "可交易候选池内任意标的，做多/做空均可；优先流动性好、规格清晰的标的。"
+        )
 
     if args.save:
         os.makedirs(args.save, exist_ok=True)
