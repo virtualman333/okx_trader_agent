@@ -277,7 +277,13 @@ def main():
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
 
-    raw_items = payload.get("items") or []
+    # 兼容两种上游格式：news_fetch.py 直接输出 list[...]，旧契约是 dict{"items":[...]}
+    if isinstance(payload, dict):
+        raw_items = payload.get("items") or []
+    elif isinstance(payload, list):
+        raw_items = payload
+    else:
+        raw_items = []
     if not raw_items:
         print("[news_log] 输入中无 items，跳过")
         return 1
